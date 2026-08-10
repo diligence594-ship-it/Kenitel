@@ -1,41 +1,41 @@
 {
   "name": "𝖤𝖣𝖴𝖢𝖠𝖳𝖨𝖮𝖭 𝖧𝖴𝖡",
   "description": "Telegram Bot using Pyrogram",
-  "repository": "https://github.com/Pod94",
+  "repository": "https://github.com/jonathanong",
   "env": {
     "API_ID": {
       "description": "Your Telegram API ID",
-      "value": "20567114",
+      "value": "22470912",
       "required": true
     },
     "API_HASH": {
       "description": "Your Telegram API Hash",
-      "value": "8a5b92106e45fc6637a65a67df060a65",
+      "value": "511be78079ed5d4bd4c967bc7b5ee023",
       "required": true
     },
     "BOT_TOKEN": {
       "description": "Your Telegram Bot Token",
-      "value": "8024972578:AAFahP8njNmQjN7Xywyo8BQ9Z_Q-232K7CI",
+      "value": "",
       "required": true
     },
     "BOT_USERNAME": {
       "description": "Your Bot Username",
-      "value": "@AshuExtractorBot",
+      "value": "",
       "required": true
     },
     "OWNER_ID": {
       "description": "Your Telegram User ID (Owner)",
-      "value": "8036182138",
+      "value": "7678862761",
       "required": true
     },
     "SUDO_USERS": {
       "description": "Comma-separated list of sudo users' IDs",
-      "value": "8036182138",
+      "value": "7678862761",
       "required": false
     },
     "CHANNEL_ID": {
       "description": "Your channel ID",
-      "value": "-1002829360841",
+      "value": "0",
       "required": true
     },
     "MONGO_URL": {
@@ -45,7 +45,7 @@
     },
     "PREMIUM_LOGS": {
       "description": "Flag for premium logs (0 for off, 1 for on)",
-      "value": "-1002829360841",
+      "value": "0",
       "required": true
     }
   },
